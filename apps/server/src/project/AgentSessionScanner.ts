@@ -214,16 +214,17 @@ function splitTranscriptRecords(contents: string, limit: number): string[] {
   return records.split("\n", limit);
 }
 
+function isTextContentBlock(block: typeof TranscriptContentBlock.Type): boolean {
+  return block.type === "text" || block.type === "input_text" || block.type === "output_text";
+}
+
 function extractText(
   content: string | ReadonlyArray<typeof TranscriptContentBlock.Type> | undefined,
 ): string {
   if (typeof content === "string") return content.trim();
   if (content === undefined) return "";
   return content
-    .filter(
-      (block) =>
-        block.type === "text" || block.type === "input_text" || block.type === "output_text",
-    )
+    .filter(isTextContentBlock)
     .map((block) => block.text?.trim() ?? "")
     .filter((text) => text.length > 0)
     .join("\n");
@@ -247,25 +248,11 @@ function codexTurnId(metadata: unknown): string | null {
   return decoded.value.turn_id;
 }
 
-/**
- * Whether Claude marked the record as subagent, injected, or compaction output,
- * which an imported thread never shows.
- */
 function isHiddenClaudeRecord(record: DecodedTranscriptRecord): boolean {
   return record.isSidechain === true || record.isMeta === true || record.isCompactSummary === true;
 }
 
-/** The user or assistant text of a Claude record, when it has any. Skip hidden records first. */
-function claudeMessage(record: DecodedTranscriptRecord) {
-  if (record.type !== "user" && record.type !== "assistant") return undefined;
-  const text = extractText(record.message?.content);
-  return text.length > 0 ? ({ role: record.type, text } as const) : undefined;
-}
-
-/**
- * The fields of a Claude thread where the newest record wins. They are folded
- * as records stream past, so the many records that carry them need not be kept.
- */
+// Claude repeats session fields on records that need not be retained.
 interface ClaudeFields {
   readonly sessionId: string | undefined;
   readonly title: string | undefined;
@@ -420,10 +407,12 @@ function parseAgentSessionRecords(
     recordIndex += 1;
     if (input.source === "claudeAgent") {
       if (isHiddenClaudeRecord(record)) continue;
-      const message = claudeMessage(record);
-      if (message === undefined) continue;
+      if (record.type !== "user" && record.type !== "assistant") continue;
+      const text = extractText(record.message?.content);
+      if (text.length === 0) continue;
       retainMessage({
-        ...message,
+        role: record.type,
+        text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
         codexResponseUser: false,
       });
@@ -516,20 +505,22 @@ function extractDecodedCwd(record: DecodedTranscriptRecord): string | null {
   return cwd && cwd.length > 0 ? cwd : null;
 }
 
-/**
- * Whether the importer needs the whole record: Claude messages and the Codex
- * records that build a thread. Claude writes a record for every attachment,
- * tool call, and event, nearly all with a cwd and a session ID, so keeping a
- * record for either would hold most of a long transcript in memory. Claude's
- * newest session ID, title, and model are folded instead.
- */
 function shouldRetainDecodedRecord(
   source: AgentSessionSource,
   record: DecodedTranscriptRecord,
 ): boolean {
   if (source === "claudeAgent") {
-    return !isHiddenClaudeRecord(record) && claudeMessage(record) !== undefined;
+    if (isHiddenClaudeRecord(record) || (record.type !== "user" && record.type !== "assistant")) {
+      return false;
+    }
+    const content = record.message?.content;
+    return typeof content === "string"
+      ? content.trim().length > 0
+      : (content?.some(
+          (block) => isTextContentBlock(block) && (block.text?.trim().length ?? 0) > 0,
+        ) ?? false);
   }
+  if (extractDecodedCwd(record) !== null) return true;
   return (
     record.type === "session_meta" ||
     record.type === "turn_context" ||

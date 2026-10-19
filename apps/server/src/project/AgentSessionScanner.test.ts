@@ -123,10 +123,6 @@ const codexRolloutLine = (cwd: string) =>
 
 const encodeTranscriptRecord = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
-/** Claude record with the cwd and session ID that real records carry. */
-const claudeRecord = (cwd: string, fields: Record<string, unknown>) =>
-  encodeTranscriptRecord({ sessionId: "long-session", cwd, ...fields });
-
 function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
   const records =
     [
@@ -1959,7 +1955,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
-    it.effect("imports a long Claude transcript whose bulk is records it ignores", () =>
+    it.effect("imports long Claude tool history with metadata from discarded records", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
         const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
@@ -1967,12 +1963,11 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const claudeHomePath = yield* makeTempDir("t3code-long-claude-");
         const codexHomePath = yield* makeTempDir("t3code-long-codex-");
         const workspace = yield* makeTempDir("t3code-long-workspace-");
-        const message = (role: "user" | "assistant", text: string) =>
-          claudeRecord(workspace, { type: role, message: { role, content: text } });
-        // Real transcripts hold thousands of tool results like this one. Each has a cwd and
-        // a session ID but no text, so together they outweigh the history budget.
-        const toolResult = claudeRecord(workspace, {
+        const record = (fields: Record<string, unknown>) =>
+          encodeTranscriptRecord({ sessionId: "first-session", ...fields });
+        const toolResult = record({
           type: "user",
+          cwd: path.join(workspace, "later-cwd"),
           message: {
             role: "user",
             content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }],
@@ -1981,12 +1976,25 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         yield* writeTranscript({
           filePath: path.join(claudeHomePath, "projects", "-slug", "long-session.jsonl"),
           contents: [
-            message("user", "First prompt"),
-            claudeRecord(workspace, { type: "ai-title", aiTitle: "Long session" }),
-            message("assistant", "First reply"),
+            record({ type: "attachment", cwd: workspace, aiTitle: "Old title" }),
+            record({ type: "user", message: { role: "user", content: "First prompt" } }),
+            record({
+              type: "assistant",
+              message: { role: "assistant", model: "claude-opus-5-5", content: "First reply" },
+            }),
+            // Small tool records exceed the real 32 MiB selected-history budget in aggregate.
             ...Array.from({ length: 20_000 }, () => toolResult),
-            message("user", "Latest prompt"),
-            message("assistant", "Latest reply"),
+            record({ type: "user", message: { role: "user", content: "Latest prompt" } }),
+            record({
+              type: "assistant",
+              message: {
+                role: "assistant",
+                model: "claude-sonnet-5-5",
+                content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }],
+              },
+            }),
+            record({ type: "ai-title", aiTitle: "Newest title" }),
+            record({ type: "attachment", sessionId: "latest-session" }),
           ].join("\n"),
           mtimeMs: nowMs,
         });
@@ -1999,19 +2007,20 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
         expect(threads).toMatchObject([
           {
-            title: "Long session",
+            providerSessionId: "latest-session",
+            title: "Newest title",
+            model: "claude-sonnet-5-5",
             messages: [
               { role: "user", text: "First prompt" },
               { role: "assistant", text: "First reply" },
               { role: "user", text: "Latest prompt" },
-              { role: "assistant", text: "Latest reply" },
             ],
           },
         ]);
       }),
     );
 
-    it.effect("does not spend the history budget on records Claude marks as hidden", () =>
+    it.effect("excludes hidden Claude records from the history budget and session metadata", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
         const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
@@ -2020,22 +2029,30 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         const codexHomePath = yield* makeTempDir("t3code-hidden-codex-");
         const workspace = yield* makeTempDir("t3code-hidden-workspace-");
         const message = (role: "user" | "assistant", text: string) =>
-          claudeRecord(workspace, { type: role, message: { role, content: text } });
-        // Each reply costs about 2 MiB of the 32 MiB history budget while it is read.
-        const hiddenReply = (flag: "isSidechain" | "isMeta" | "isCompactSummary") =>
-          claudeRecord(workspace, {
-            type: "assistant",
-            [flag]: true,
-            message: { role: "assistant", content: "x".repeat(1024 * 1024) },
+          encodeTranscriptRecord({
+            sessionId: "visible-session",
+            cwd: workspace,
+            type: role,
+            message: { role, content: text },
           });
         const flags = ["isSidechain", "isMeta", "isCompactSummary"] as const;
+        // Each hidden reply selects about 2 MiB; together they exceed the real 32 MiB budget.
+        const hiddenReply = (flag: (typeof flags)[number]) =>
+          encodeTranscriptRecord({
+            sessionId: "hidden-session",
+            aiTitle: "Hidden title",
+            type: "assistant",
+            [flag]: true,
+            message: { role: "assistant", model: "hidden-model", content: "x".repeat(1024 * 1024) },
+          });
         yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-slug", "long-session.jsonl"),
+          filePath: path.join(claudeHomePath, "projects", "-slug", "hidden-session.jsonl"),
           contents: [
             message("user", "First prompt"),
             message("assistant", "First reply"),
             ...Array.from({ length: 20 }, (_, index) => hiddenReply(flags[index % flags.length]!)),
             message("user", "Latest prompt"),
+            hiddenReply("isSidechain"),
           ].join("\n"),
           mtimeMs: nowMs,
         });
@@ -2048,118 +2065,13 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
         expect(threads).toMatchObject([
           {
+            providerSessionId: "visible-session",
+            title: "First prompt",
+            model: null,
             messages: [
               { role: "user", text: "First prompt" },
               { role: "assistant", text: "First reply" },
               { role: "user", text: "Latest prompt" },
-            ],
-          },
-        ]);
-      }),
-    );
-
-    it.effect("reads the session ID, title, and model from records it does not keep", () =>
-      Effect.gen(function* () {
-        const path = yield* Path.Path;
-        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
-        yield* TestClock.setTime(nowMs);
-        const claudeHomePath = yield* makeTempDir("t3code-fields-claude-");
-        const codexHomePath = yield* makeTempDir("t3code-fields-codex-");
-        const workspace = yield* makeTempDir("t3code-fields-workspace-");
-        const record = (sessionId: string, fields: Record<string, unknown>) =>
-          claudeRecord(workspace, { sessionId, ...fields });
-        // The newest model, title, and session ID are each on a record with no visible text.
-        yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-slug", "fields-session.jsonl"),
-          contents: [
-            record("first-session", {
-              type: "user",
-              message: { role: "user", content: "Prompt" },
-            }),
-            record("first-session", {
-              type: "assistant",
-              message: {
-                role: "assistant",
-                model: "claude-opus-5-5",
-                content: [{ type: "text", text: "Reply" }],
-              },
-            }),
-            record("second-session", {
-              type: "assistant",
-              message: {
-                role: "assistant",
-                model: "claude-sonnet-5-5",
-                content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: {} }],
-              },
-            }),
-            record("second-session", { type: "ai-title", aiTitle: "Newest title" }),
-            record("third-session", { type: "attachment" }),
-          ].join("\n"),
-          mtimeMs: nowMs,
-        });
-
-        const threads = yield* runRecentThreads({
-          claudeHomePath,
-          codexHomePath,
-          workspaceRoot: workspace,
-        });
-
-        expect(threads).toMatchObject([
-          {
-            providerSessionId: "third-session",
-            title: "Newest title",
-            model: "claude-sonnet-5-5",
-            messages: [
-              { role: "user", text: "Prompt" },
-              { role: "assistant", text: "Reply" },
-            ],
-          },
-        ]);
-      }),
-    );
-
-    it.effect("reads the working directory from a record the import skips", () =>
-      Effect.gen(function* () {
-        const path = yield* Path.Path;
-        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
-        yield* TestClock.setTime(nowMs);
-        const claudeHomePath = yield* makeTempDir("t3code-cwd-claude-");
-        const codexHomePath = yield* makeTempDir("t3code-cwd-codex-");
-        const workspace = yield* makeTempDir("t3code-cwd-workspace-");
-        // Only the attachment names a cwd, and it is not imported. The messages carry none.
-        yield* writeTranscript({
-          filePath: path.join(claudeHomePath, "projects", "-slug", "cwd-session.jsonl"),
-          contents: [
-            encodeTranscriptRecord({
-              type: "attachment",
-              sessionId: "cwd-session",
-              cwd: workspace,
-            }),
-            encodeTranscriptRecord({
-              type: "user",
-              sessionId: "cwd-session",
-              message: { role: "user", content: "Prompt" },
-            }),
-            encodeTranscriptRecord({
-              type: "assistant",
-              sessionId: "cwd-session",
-              message: { role: "assistant", content: "Reply" },
-            }),
-          ].join("\n"),
-          mtimeMs: nowMs,
-        });
-
-        const threads = yield* runRecentThreads({
-          claudeHomePath,
-          codexHomePath,
-          workspaceRoot: workspace,
-        });
-
-        expect(threads).toMatchObject([
-          {
-            messages: [
-              { role: "user", text: "Prompt" },
-              { role: "assistant", text: "Reply" },
             ],
           },
         ]);
